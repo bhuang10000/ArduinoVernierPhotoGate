@@ -1,5 +1,5 @@
 /*
- VernierPhotogateTimmer (v 2013.11)
+ VernierPhotogateTimmer (v 2013.12.09)
  Monitors a Vernier Photogate connected to BTD connector. 
  
  This sketch lists the time in microseconds since the program started running.
@@ -10,37 +10,56 @@
  
  For more details around using Arduino with Vernier see 
  www.vernier.com/arduino. 
-
+ 
  Modified by: B. Huang, SparkFun Electronics
- December 4, 2013
-  
-*/
-
+ December 9, 2013
+ 
+ This version incorporates a "circular" buffer of 150 elements and stores all events 
+ (blocking and unblocking) of the photogate to an precision of 1 us. In addition, 
+ the data is streamed to the Serial buffer and can be captured, copied, exported, 
+ and analyzed in your favorite analysis tool -- Graphical Analysis, LoggerPro, Excel,
+ Google Sheets, Matlab, etc...
+ 
+ */
 #include <SoftwareSerial.h>
 
-int refreshRate = 5;  // sets # of milliseconds between refreshes of LED Display
-int mode = 1; // sets the default mode of operation
-// Mode 1 -- Gate, Mode 2 -- Pulse, Mode 3 -- Pendulum 
+#define bufferSize 150  // Sets the size of the circular buffer for storing interrupt data events. Increasing this may cause erratic behavior of the code.
+#define DELIM '\t'   // this is the data delimitter. Default setting is a tab character ("\t") 
+
+const int baudRate = 9600;  // Baud rate for serial communications. Increase this for high data rate applications (i.e. smart pulley)
+
+unsigned int refreshRate = 250;  // sets # of milliseconds between refreshes of LED Display
 
 const int buttonPin = 12;   // default buttonPin on Vernier Shield
 const int s7segPin = 13;    // re-purposed pin 13 to tie to the Serial 7 Segment
 const int photogatePin = 2; // default pin if plugged into Digital 1 on SparkFun Vernier Shield 
 
-volatile int photogate = HIGH;
-volatile int state;  // 1 == start, 0 == stop
+/* The following variables are all used and modified by the code. These should not be changed or re-named. */
+int mode = 1; // sets the default mode of operation
+// Mode 1 -- Gate, Mode 2 -- Pulse, Mode 3 -- Pendulum 
+
 int lastState; 
 int currTimeDigits;
-unsigned long currTime;
+unsigned long currTime; 
+unsigned int displayIndex; // the current item that has been displayed to the Serial Monitor from the data buffer.
+unsigned int count;  // tracks the total # of data entries 
 
 SoftwareSerial s7s1(0, s7segPin);  // sets up Software Serial to interface to Seven Segment Display
 
-char tempString[4];
-unsigned long timeRef = 0;
-int numBlocks;
-int numInterrupts = 0;
+char tempString[4];   // String buffer to store for sending to the serial 7 segment display
+unsigned long timeRef = 0;  // timeRef for use with refreshRate of the Serial 7 segment display
 
-volatile unsigned long startTime;  //Time in ms
-volatile unsigned long stopTime;  //Time in ms
+/* These variables are all accessed and modified by the interrupt handler "PhotogateEvent" 
+Variables used by the Interrupt handler must be defined as volatile. */
+volatile int photogate = HIGH;
+volatile int start = 0;  // 1 == start, 0 == stop
+volatile unsigned int numBlocks;
+volatile unsigned long startTime;  //Time in us
+volatile unsigned long stopTime;  //Time in us
+volatile byte dataIndex;
+volatile byte displayCount;  // stores the number of items in data Buffer to be displayed
+volatile byte state[bufferSize];
+volatile unsigned long time_us[bufferSize]; // Time in us
 
 void setup() 
 {
@@ -52,66 +71,60 @@ void setup()
   clearDisplay();
   Serial.begin(9600);           // set up Serial library at 9600 bps
 
-  if(Serial)
-  {
-    timeRef = millis();
-    displayStartUpMenu();
-    clearDisplay();
-    delay(10);
+  timeRef = micros();
+  displayStartUpMenu();
+  clearDisplay();
+  delay(10);
 
-    while((Serial.available() == 0) &&  ((millis() - timeRef) < 5000) && (digitalRead(buttonPin) == HIGH))  // defaults out to mode = 1 after 5 seconds
-    {  
-      sprintf(tempString, "%4d", (millis() - timeRef));     
-      s7sprint(tempString);
-    }; // hold and wait until data is available.
+  while((Serial.available() == 0) &&  ((micros() - timeRef) < 10E6) && (digitalRead(buttonPin) == HIGH))  // defaults out to mode = 1 after 10 seconds
+  {  
+    sprintf(tempString, "%4d", (micros() - timeRef)/1000); 
+    s7sprint(tempString);
+  }; // hold and wait until data is available.
 
-    int userInput = Serial.parseInt();
-    Serial.println();
+  int userInput = Serial.parseInt();
+  Serial.println();
 
-    if ( (userInput >= 1) || (userInput <= 3))
-      mode = userInput;
-    else
-      mode = 1;
-    Serial.print("Starting up... ");
-
-    clearDisplay();
-    switch (mode)
-    {
-    case 1:
-      Serial.println("Gate Mode"); 
-      s7s1.print("Gate");
-      break;
-    case 2:
-      Serial.println("Pulse Mode"); 
-      s7s1.print("Puls");
-      break;
-    case 3:
-      Serial.println("Pendulum Mode"); 
-      s7s1.print("Pend");
-      break;
-    default:
-      Serial.println("Gate Mode*"); 
-      s7s1.print("Gate");
-      mode = 1;
-      break;
-    } // end switch mode
-  } // end if Serial
+  if ( (userInput >= 1) || (userInput <= 3))
+    mode = userInput;
   else
+    mode = 1;
+  Serial.print("Starting up... ");
+
+  clearDisplay();
+  switch (mode)
   {
-    mode = 1; 
-  }
-    displayHeader();
+  case 1:
+    Serial.println("Gate Mode"); 
+    s7s1.print("Gate");
+    break;
+  case 2:
+    Serial.println("Pulse Mode"); 
+    s7s1.print("Puls");
+    break;
+  case 3:
+    Serial.println("Pendulum Mode"); 
+    s7s1.print("Pend");
+    break;
+  default:
+    Serial.println("Gate Mode*"); 
+    s7s1.print("Gate");
+    mode = 1;
+    break;
+  } // end switch mode
+
+  displayHeader();
 
 };// end of setup
 
 void loop ()
 { 
+  // check for button press to change modes
   if (digitalRead(12) == LOW)
   {
     mode++;
-    numBlocks = 0;
-    numInterrupts = 0;
-    state = 0;
+    resetCount();
+
     if (mode > 3) mode = 1;
     clearDisplay();
     switch (mode)
@@ -129,15 +142,94 @@ void loop ()
       s7s1.print("Pend");
       break;
     }    
-
-    while((digitalRead(buttonPin) == LOW));
-    delay(50);
+    while((digitalRead(buttonPin) == LOW)); // hold until button is released
+    delay(10); // for de-bouncing
     displayHeader();
   } // if button is pressed
-  
-  startTimer();
+
+  if ((micros() - timeRef) >= refreshRate*1000) // for refreshing serial 7 segment 
+  { 
+    timeRef = micros();
+
+    if (start == 1)
+    { 
+      currTime = (micros() - startTime) / 1000;
+      currTimeDigits = log10(currTime);
+      sprintf(tempString, "%4lu", currTime);     
+
+      for(int x = 0; x <  3 - currTimeDigits; x++)  // zero padding
+      {
+        tempString[x] = '0';        
+      } 
+
+      s7sprint(tempString);
+      lastState = 1;
+    }
+    else // if (state == 1)
+    { 
+      if (lastState == 1)
+      {
+        currTimeDigits = log10(stopTime - startTime) - 3; // because we're using micros, - 3 is the same as dividing by 1000
+        sprintf(tempString, "%4lu", (stopTime - startTime)/1000);
+
+        for(int x = 0; x <  3 - currTimeDigits; x++)  // zero padding 
+        {
+          tempString[x] = '0';        
+        } 
+        clearDisplay();
+        s7sprint(tempString);
+      }
+      lastState = 0;  
+    }
+  } //   if ((millis() - timeRef) >= refreshRate) // for refreshing serial 7 segment 
+
+  uint8_t oldSREG = SREG;
+  cli();
+
+  if (displayCount > 0)  // only display to Serial monitor if an interrupt has added data to the data buffer.
+  {
+    count++;
+
+    Serial.print(count);
+    Serial.print(DELIM); //tab character
+    Serial.print(state[displayIndex]);
+    Serial.print(DELIM); //tab character
+    Serial.print(time_us[displayIndex] / 1E6, 6);  // at least 6 sig figs
+
+    Serial.print(DELIM);
+    Serial.print((time_us[displayIndex] - startTime) / 1E6, 6);
+    Serial.print(DELIM);
+    Serial.print(startTime == time_us[displayIndex]);
+
+    Serial.print(DELIM);
+    Serial.print(time_us[displayIndex] == stopTime);
+
+    Serial.println();
+
+    displayIndex++;
+    if(displayIndex >= bufferSize)
+    {
+      displayIndex = 0;
+    }
+    displayCount--; // deduct one
+  }
+  SREG = oldSREG;
+  sei();
+
 } // end of loop
 
+void resetCount()
+{
+  dataIndex = 0;
+  displayIndex = 0;
+  count = 0;
+  numBlocks = 0;
+  start = 0;
+  Serial.println();
+  Serial.println("*****Reset*****");
+  Serial.println();
+
+}
 
 /*************************************************
  * photogateEvent()
@@ -151,46 +243,50 @@ void loop ()
  *************************************************/
 void photogateEvent()
 { 
-  numInterrupts++;
+  time_us[dataIndex] = micros();
+
   photogate = digitalRead(photogatePin);
-  if (photogate == LOW)  // blocked -- start timer
+  state[dataIndex] = photogate;
+
+  displayCount++;  // add one to "to be displayed" buffer
+
+  if(photogate == LOW)                                  // trigger only when gate is blocked
   {
     numBlocks++;  
-    if (state == 0)
-    {
-      startTime = millis();
-      state = 1; // start timer    
+    if (start == 0) // if first event -- start timer
+
+    {    
+      startTime = time_us[dataIndex];
+      start = 1;    // sets start flag to TRUE  
     }
-    else if (mode == 2)  // 
+
+    else if (mode == 2)  // Pulse Mode
     {
-      stopTime = millis();
-      state = 0;
+      stopTime = time_us[dataIndex]; 
+      start = 0;
     }
-    else if ((mode == 3) && ((numBlocks % 3) == 0)) // 
+    else if ((mode == 3) && ((numBlocks % 3) == 0))     // Pedulum Mode
     {
-      stopTime = millis();
-      state = 0;  
+      stopTime = time_us[dataIndex];
+      start = 0;  
     }
-  }
+  } // if(photogate == LOW)
 
   else
   {
     if (mode == 1) // gate mode
     {
-      stopTime = millis();
-      state = 0;
+      stopTime = time_us[dataIndex];
+      start = 0;  // reset
     }  
   }
 
-  Serial.print(numInterrupts);
-  Serial.print("\t");
-  Serial.print(numBlocks);
-  Serial.print("\t");
-  Serial.print(photogate);
-  Serial.print("\t");
-  Serial.print(millis());
-  Serial.print("\t");
-  Serial.println(millis() - startTime);
+  dataIndex++;
+  if(dataIndex >= bufferSize)
+  {
+    dataIndex = 0;
+  }
+
 }
 
 /*************************************************
@@ -203,34 +299,55 @@ void photogateEvent()
  *************************************************/
 void displayHeader()
 {
+  Serial.println("Vernier Format 2");
+  Serial.println();
   Serial.print("Event");
-  Serial.print("\t");
-  Serial.print("Blocks");
-  Serial.print("\t");
-  Serial.print("Gate");
-  Serial.print("\t");
-  Serial.print("Time");  
-  Serial.print("\t");
-  Serial.println("dTime");  
-  Serial.println("-------------------------------------");  
+  Serial.print(DELIM);
+  Serial.print("Blocked");
+  Serial.print(DELIM);
+  Serial.print("Time       ");    
+  Serial.print(DELIM);
+  Serial.print("dTime      ");  
+  Serial.print(DELIM);
+  Serial.print("Start?");  
+  Serial.print(DELIM);
+  Serial.print("Stop?");  
+  Serial.println();
+
+// Units
+  Serial.print("#");
+  Serial.print(DELIM);
+  Serial.print("(n/a)");
+  Serial.print(DELIM);
+  Serial.print("(s)         ");    
+  Serial.print(DELIM);
+  Serial.print("(s)         ");  
+  Serial.print(DELIM);
+  Serial.print("(n/a)");  
+  Serial.print(DELIM);
+  Serial.print("(n/a)");  
+  Serial.println();
+  
+  
+  Serial.println("---------------------------------------------------------------");  
 }
 
 void displayStartUpMenu()
 {
-     Serial.println("Vernier Photogate Timer");
-    Serial.println("");
-    Serial.println("Connect the RX pin of any SparkFun Serial 7 Segment");
-    Serial.println("LED Display to pin 12.");
-    Serial.println("");
-    Serial.println("The display will show the time elapsed for the photogate.");
+  Serial.println("Vernier Photogate Timer");
+  Serial.println("");
+  Serial.println("Connect the RX pin of any SparkFun Serial 7 Segment");
+  Serial.println("LED Display to pin 12.");
+  Serial.println("");
+  Serial.println("The display will show the time elapsed for the photogate.");
 
-    Serial.println("Select the operating mode: ");
-    Serial.println("1) Gate mode");  
-    // Gate timing begins when the photogate is first blocked. The timing will continue until the gate is unblocked.
-    Serial.println("2) Pulse mode");
-    // Pulse timing begins when the photogate is first blocked. The timing will continue until the gate is blocked again.
-    Serial.println("3) Pendulum mode");
- 
+  Serial.println("Select the operating mode: ");
+  Serial.println("1) Gate mode");  
+  // Gate timing begins when the photogate is first blocked. The timing will continue until the gate is unblocked.
+  Serial.println("2) Pulse mode");
+  // Pulse timing begins when the photogate is first blocked. The timing will continue until the gate is blocked again.
+  Serial.println("3) Pendulum mode");
+
 }
 
 /*************************************************
@@ -266,9 +383,6 @@ void clearDisplay()
  **************************************************/
 void s7sprint(String toSend)
 {
-  //  Serial.print(toSend);
-  //  Serial.print("\t");
-  //  Serial.println(toSend.length());
   s7s1.print(toSend.substring(0, 4));
 
   if (toSend.length() == 1)
@@ -278,81 +392,6 @@ void s7sprint(String toSend)
   // Turn on decimals based on the length of string -- only displaying 4
   // sig figs.
 }
-
-/*************************************************
- * This is the entire timer routine to display to
- * the the seven segment displays. It refreshes only 
- * as often as the refreshRate. 
- * 
- * state = 1 --> start timer
- * state = 0 --> stop timer
- **************************************************/
-void startTimer()
-{
-  if ((millis() - timeRef) >= refreshRate)
-  { 
-    timeRef = millis();
-    if (state == 1)
-    { 
-      currTime = millis() - startTime;
-      currTimeDigits = log10(currTime);
-      sprintf(tempString, "%4lu", currTime);     
-
-      for(int x = 0; x <  3 - currTimeDigits; x++)  // zero padding
-      {
-        tempString[x] = '0';        
-      } 
-
-      s7sprint(tempString);
-      lastState = 1;  
-    }
-    else // if (state == 1)
-    { 
-      if (lastState == 1)
-      {
-        currTimeDigits = log10(stopTime - startTime);
-        sprintf(tempString, "%4lu", (stopTime - startTime));
-
-        for(int x = 0; x <  3 - currTimeDigits; x++)  // zero padding 
-        {
-          tempString[x] = '0';        
-        } 
-        clearDisplay();
-        s7sprint(tempString);
-      }
-      lastState = 0;  
-    }
-  }
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
