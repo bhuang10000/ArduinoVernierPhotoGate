@@ -17,9 +17,8 @@ Repository Contents
   functionality. Connect PWR and GND to your Arduino and connect the RX line to Pin 13
   on the Arduino. These configurations can all be changed in the code.
 
-* **/VernierPhotogate_SerialOut/* - Arduino example code for timing events with Arduino. 
   This code uses interrupts and is accurate down to the microsecond. The code currently provides
-  6 sig figs back to the Serial Monitor. 
+  6 sig figs back to the Serial Monitor. Precision down to 1 uS.
   
   Data is collected and stored into a circular array. However - this array can over-run, if the 
   interrupts occur faster than data is displayed to the screen. You can fix this by increasing the
